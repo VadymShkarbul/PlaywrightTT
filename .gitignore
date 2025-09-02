@@ -103,3 +103,4 @@ logs/
 
 # Local data artifacts
 src/out.csv
+/out

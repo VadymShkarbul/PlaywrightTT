@@ -2,31 +2,40 @@ import argparse
 import csv
 import os
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urljoin
 from playwright.sync_api import sync_playwright, Page, ViewportSize
 
 # Configuration
 SELLER_URL_DEFAULT = "https://www.amazon.co.uk/sp?seller=A01609602H16VOVDUKH19"
 ZIP_CODES = {"us": "10001", "uk": "SW1A 1AA", "es": "28001"}
-CSV_FILE = "out.csv"
+CSV_FILE = os.getenv("CSV_FILE", "out.csv")
 CSV_HEADER = ["country", "zip", "seller_url", "product_url", "title", "price"]
 
 # Logging setup
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s") # noqa
 logger = logging.getLogger(__name__)
 
+# Threading
+_csv_lock = threading.Lock()
+
 
 def init_csv() -> None:
-    """Create a CSV file with headers"""
+    """Create a CSV file with headers and ensure parent directory exists"""
+    parent = os.path.dirname(CSV_FILE)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     if not os.path.exists(CSV_FILE):
         with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow(CSV_HEADER)
 
 
 def save_row(row: list[str]) -> None:
-    """Append a row to the CSV"""
-    with open(CSV_FILE, "a", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerow(row)
+    """Append a row to the CSV (thread-safe)"""
+    with _csv_lock:
+        with open(CSV_FILE, "a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(row)
 
 
 def set_location(page: Page, zip_code: str) -> bool:
@@ -127,62 +136,71 @@ def main():
 
     init_csv()
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        user_agent = (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/126.0.0.0 Safari/537.36"
-        )
-        viewport = {"width": 1366, "height": 768}
-        context = browser.new_context(
-            user_agent=user_agent,
-            viewport=ViewportSize(**viewport)
-        )
-        page: Page = context.new_page()
+    def parsing_task(task_id: int):
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            user_agent = (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/126.0.0.0 Safari/537.36"
+            )
+            viewport = {"width": 1366, "height": 768}
+            context = browser.new_context(
+                user_agent=user_agent,
+                viewport=ViewportSize(**viewport)
+            )
+            page: Page = context.new_page()
 
-        try:
-            logger.info("1. Opening seller page...")
-            page.goto(seller_url)
-            page.wait_for_load_state("domcontentloaded")
+            try:
+                logger.info("[T%s] 1. Opening seller page...", task_id)
+                page.goto(seller_url)
+                page.wait_for_load_state("domcontentloaded")
 
-            logger.info("2. Setting location...")
-            set_location(page, zip_code)
+                logger.info("[T%s] 2. Setting location...", task_id)
+                set_location(page, zip_code)
 
-            logger.info("3. Finding storefront...")
-            storefront_url = get_storefront_url(page)
-            if not storefront_url:
-                logger.warning("Storefront not found")
-                return
+                logger.info("[T%s] 3. Finding storefront...", task_id)
+                storefront_url = get_storefront_url(page)
+                if not storefront_url:
+                    logger.warning("Storefront not found")
+                    return
 
-            logger.info("4. Navigating to storefront: %s", storefront_url)
-            page.goto(storefront_url)
-            page.wait_for_load_state("domcontentloaded")
+                logger.info("[T%s] 4. Navigating to storefront: %s", task_id, storefront_url)
+                page.goto(storefront_url)
+                page.wait_for_load_state("domcontentloaded")
 
-            logger.info("5. Searching for the first product...")
-            product_href = get_first_product_url(page)
-            if not product_href:
-                logger.warning("Product not found")
-                save_row([country, zip_code, seller_url, "", "", ""])
-                return
+                logger.info("[T%s] 5. Searching for the first product...", task_id)
+                product_href = get_first_product_url(page)
+                if not product_href:
+                    logger.warning("Product not found")
+                    save_row([country, zip_code, seller_url, "", "", ""])
+                    return
 
-            product_url = urljoin(page.url, product_href)
+                product_url = urljoin(page.url, product_href)
 
-            logger.info("6. Navigating to product: %s", product_url)
-            page.goto(product_url)
-            page.wait_for_load_state("domcontentloaded")
+                logger.info("[T%s] 6. Navigating to product: %s", task_id, product_url)
+                page.goto(product_url)
+                page.wait_for_load_state("domcontentloaded")
 
-            logger.info("7. Getting product information...")
-            title, price = get_product_info(page)
+                logger.info("[T%s] 7. Getting product information...", task_id)
+                title, price = get_product_info(page)
 
-            save_row([country, zip_code, seller_url, product_url, title, price])
-            logger.info("Saved: %s... | %s", title[:50], price)
+                save_row([country, zip_code, seller_url, product_url, title, price])
+                logger.info("Saved: %s... | %s", title[:50], price)
 
-        except Exception as e:
-            logger.exception("Error: %s", e)
-        finally:
-            browser.close()
+            except Exception as e:
+                logger.exception("[T%s] Error: %s", task_id, e)
+            finally:
+                browser.close()
 
+    tasks = [1, 2]
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(parsing_task, t) for t in tasks]
+        for f in as_completed(futures):
+            try:
+                f.result()
+            except Exception as e:
+                logger.exception("A thread failed: %s", e)
 
 if __name__ == "__main__":
     main()
